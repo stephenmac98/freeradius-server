@@ -93,8 +93,7 @@ void fr_curl_free(void)
 
 int fr_curl_easy_tls_init (fr_curl_io_request_t *randle, fr_curl_tls_t *conf)
 {
-	int	ret;
-
+	REQUEST *request = randle->request;
 	if (conf->tls_certificate_file) FR_CURL_SET_OPTION(CURLOPT_SSLCERT, conf->tls_certificate_file);
 	if (conf->tls_private_key_file) FR_CURL_SET_OPTION(CURLOPT_SSLKEY, conf->tls_private_key_file);
 	if (conf->tls_private_key_password) FR_CURL_SET_OPTION(CURLOPT_KEYPASSWD, conf->tls_private_key_password);
@@ -199,3 +198,17 @@ int fr_curl_response_certinfo(REQUEST *request, fr_curl_io_request_t *randle)
 	}
 	return 0;
 }
+
+CONF_PARSER fr_curl_tls_config[] = {
+	{ FR_CONF_OFFSET("ca_file", FR_TYPE_FILE_INPUT, fr_curl_tls_t, tls_ca_file) },
+	{ FR_CONF_OFFSET("ca_issuer_file", FR_TYPE_FILE_INPUT, fr_curl_tls_t, tls_ca_issuer_file) },
+	{ FR_CONF_OFFSET("ca_path", FR_TYPE_FILE_INPUT, fr_curl_tls_t, tls_ca_path) },
+	{ FR_CONF_OFFSET("certificate_file", FR_TYPE_FILE_INPUT, fr_curl_tls_t, tls_certificate_file) },
+	{ FR_CONF_OFFSET("private_key_file", FR_TYPE_FILE_INPUT, fr_curl_tls_t, tls_private_key_file) },
+	{ FR_CONF_OFFSET("private_key_password", FR_TYPE_STRING | FR_TYPE_SECRET, fr_curl_tls_t, tls_private_key_password) },
+	{ FR_CONF_OFFSET("random_file", FR_TYPE_STRING, fr_curl_tls_t, tls_random_file) },
+	{ FR_CONF_OFFSET("check_cert", FR_TYPE_BOOL, fr_curl_tls_t, tls_check_cert), .dflt = "yes" },
+	{ FR_CONF_OFFSET("check_cert_cn", FR_TYPE_BOOL, fr_curl_tls_t, tls_check_cert_cn), .dflt = "yes" },
+	{ FR_CONF_OFFSET("extract_cert_attrs", FR_TYPE_BOOL, fr_curl_tls_t, tls_extract_cert_attrs), .dflt = "no" },
+	CONF_PARSER_TERMINATOR
+};
