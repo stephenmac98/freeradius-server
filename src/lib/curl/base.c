@@ -184,7 +184,7 @@ int fr_curl_response_certinfo(REQUEST *request, fr_curl_io_request_t *randle)
 		 *	set cert_vps.  This is because they're too dumb
 		 *	to realise that the cursor argument passed to
 		 *	tls_session_pairs_from_x509_cert contains a
-		 *	reference to cert_vps.
+		 *	reference to cert_vps. 
 		 */
 		cert_vps = fr_cursor_current(&cursor);
 		if (cert_vps) {
