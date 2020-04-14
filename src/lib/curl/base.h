@@ -43,7 +43,7 @@ do {\
 		char const *_option;\
 		_option = STRINGIFY(_x);\
 		ROPTIONAL(RERROR, ERROR, "Failed setting curl option %s: %s (%i)", _option, curl_easy_strerror(_ret), _ret);\
-		goto error;\
+	goto error;\
 	}\
 } while (0)
 
