@@ -153,7 +153,7 @@ static rlm_rcode_t mod_authenticate_resume(void *instance, UNUSED void *thread, 
 }
 /*
  * Checks that there is a User-Name and User-Password field in the request
- * Checks that User-Password is not Blank
+ * Checks that User-Password is not Blanksdfasdfasdfasdfasdfasdfasdf
  * Sets the: username, password
  * website URI
  * timeout information
