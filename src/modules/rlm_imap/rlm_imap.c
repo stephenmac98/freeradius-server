@@ -73,7 +73,7 @@ typedef struct {
 } rlm_imap_request_t;
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("imap_URI", FR_TYPE_STRING, rlm_imap_t, imap_URI) },
+	{ FR_CONF_OFFSET("imap_uri", FR_TYPE_STRING, rlm_imap_t, imap_URI) },
 	{ FR_CONF_OFFSET("timeout",FR_TYPE_TIME_DELTA, rlm_imap_t, timeout) },
 	{ FR_CONF_OFFSET("tls", FR_TYPE_SUBSECTION, rlm_imap_t, tls), .subcs = (void const *) fr_curl_tls_config },//!<loading the tls values
 	CONF_PARSER_TERMINATOR
