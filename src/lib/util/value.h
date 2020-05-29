@@ -29,7 +29,7 @@ extern "C" {
 
 #define FR_MAX_STRING_LEN	254	/* RFC2138: string 0-253 octets */
 
-typedef struct value_box fr_value_box_t;
+typedef struct value_box_s fr_value_box_t;
 
 #ifdef __cplusplus
 }
@@ -92,7 +92,7 @@ typedef struct {
  *
  * fr_type_t should be an enumeration of the values in this union.
  */
-struct value_box {
+struct value_box_s {
 	union {
 		/*
 		 *	Variable length values
@@ -113,8 +113,8 @@ struct value_box {
 		 */
 		fr_ipaddr_t		ip;			//!< IPv4/6 address/prefix.
 
-		uint8_t			ifid[8];		//!< IPv6 interface ID (should be struct?).
-		uint8_t			ether[6];		//!< Ethernet (MAC) address.
+		fr_ifid_t		ifid;			//!< IPv6 interface ID.
+		fr_ethernet_t		ether;			//!< Ethernet (MAC) address.
 
 		bool			boolean;		//!< A truth value.
 
@@ -165,8 +165,8 @@ struct value_box {
 
 #define vb_ip					datum.ip
 
-#define vb_ifid					datum.ifid
-#define vb_ether				datum.ether
+#define vb_ifid					datum.ifid.addr
+#define vb_ether				datum.ether.addr
 
 #define vb_bool					datum.boolean
 #define vb_uint8				datum.uint8
@@ -346,6 +346,14 @@ static inline CC_HINT(always_inline) void fr_value_box_init(fr_value_box_t *vb, 
 	}, sizeof(*vb));
 }
 
+/** Initialise an empty/null box that will be filled later
+ *
+ */
+static inline CC_HINT(always_inline) void fr_value_box_init_null(fr_value_box_t *vb)
+{
+	fr_value_box_init(vb, FR_TYPE_INVALID, NULL, false);
+}
+
 /** Allocate a value box of a specific type
  *
  * Allocates memory for the box, and sets the length of the value
@@ -393,7 +401,7 @@ static inline CC_HINT(always_inline) fr_value_box_t *fr_value_box_alloc_null(TAL
  * @return 0 (always successful).
  */
 static inline CC_HINT(always_inline) int fr_value_box_ethernet_addr(fr_value_box_t *dst, fr_dict_attr_t const *enumv,
-								    uint8_t const src[static 6], bool tainted)
+								    fr_ethernet_t const *src, bool tainted)
 {
 	fr_value_box_init(dst, FR_TYPE_ETHERNET, enumv, tainted);
 	memcpy(dst->vb_ether, src, sizeof(dst->vb_ether));
@@ -443,6 +451,8 @@ DEF_BOXING_FUNC(uint64_t, date, FR_TYPE_DATE)
 _Generic((_var), \
 	fr_ipaddr_t *		: fr_value_box_ipaddr, \
 	fr_ipaddr_t const *	: fr_value_box_ipaddr, \
+	fr_ethernet_t *		: fr_value_box_ethernet_addr, \
+	fr_ethernet_t const *	: fr_value_box_ethernet_addr, \
 	bool			: fr_value_box_bool, \
 	uint8_t			: fr_value_box_uint8, \
 	uint8_t const		: fr_value_box_uint8, \
@@ -474,7 +484,7 @@ _Generic((_var), \
  *	- 0 on success.
  *	- -1 on type mismatch.
  */
-static inline int fr_value_unbox_ethernet_addr(uint8_t dst[6], fr_value_box_t *src)
+static inline int fr_value_unbox_ethernet_addr(fr_ethernet_t *dst, fr_value_box_t *src)
 {
 	if (unlikely(src->type != FR_TYPE_ETHERNET)) { \
 		fr_strerror_printf("Unboxing failed.  Needed type %s, had type %s",
@@ -592,7 +602,7 @@ void		fr_value_box_clear(fr_value_box_t *data);
 int		fr_value_box_copy(TALLOC_CTX *ctx, fr_value_box_t *dst, const fr_value_box_t *src);
 
 void		fr_value_box_copy_shallow(TALLOC_CTX *ctx, fr_value_box_t *dst,
-					  const fr_value_box_t *src, bool incr_ref);
+					  const fr_value_box_t *src);
 
 int		fr_value_box_steal(TALLOC_CTX *ctx, fr_value_box_t *dst, fr_value_box_t const *src);
 /** @} */

@@ -1851,9 +1851,6 @@ ssize_t tmpl_afrom_str(TALLOC_CTX *ctx, vp_tmpl_t **out,
  * #tmpl_cast_in_place can be used to convert #TMPL_TYPE_UNPARSED to a #TMPL_TYPE_DATA of a
  *  specified #fr_type_t.
  *
- * #tmpl_cast_in_place_str does the same as #tmpl_cast_in_place, but will always convert to
- * #fr_type_t #FR_TYPE_STRING.
- *
  * #tmpl_cast_to_vp does the same as #tmpl_cast_in_place, but outputs a #VALUE_PAIR.
  *
  * #tmpl_define_unknown_attr converts a #TMPL_TYPE_ATTR with an unknown #fr_dict_attr_t to a
@@ -1913,82 +1910,6 @@ int tmpl_cast_in_place(vp_tmpl_t *vpt, fr_type_t type, fr_dict_attr_t const *enu
 
 	TMPL_VERIFY(vpt);
 
-	return 0;
-}
-
-/** Convert #vp_tmpl_t of type #TMPL_TYPE_UNPARSED to #TMPL_TYPE_DATA of type #FR_TYPE_STRING
- *
- * @note Conversion is done in place.
- *
- * @param[in,out] vpt The template to modify. Must be of type #TMPL_TYPE_UNPARSED.
- */
-void tmpl_cast_in_place_str(vp_tmpl_t *vpt)
-{
-	fr_assert(vpt != NULL);
-	fr_assert(tmpl_is_unparsed(vpt));
-
-	vpt->type = TMPL_TYPE_DATA;
-
-	fr_value_box_strdup(vpt, &vpt->data.literal, NULL, vpt->name, false);
-}
-
-/** Expand a #vp_tmpl_t to a string, parse it as an attribute of type cast, create a #VALUE_PAIR from the result
- *
- * @note Like #tmpl_expand, but produces a #VALUE_PAIR.
- *
- * @param out Where to write pointer to the new #VALUE_PAIR.
- * @param request The current #REQUEST.
- * @param vpt to cast. Must be one of the following types:
- *	- #TMPL_TYPE_UNPARSED
- *	- #TMPL_TYPE_EXEC
- *	- #TMPL_TYPE_XLAT_UNPARSED
- *	- #TMPL_TYPE_XLAT
- *	- #TMPL_TYPE_ATTR
- *	- #TMPL_TYPE_DATA
- * @param cast type of #VALUE_PAIR to create.
- * @return
- *	- 0 on success.
- *	- -1 on failure.
- */
-int tmpl_cast_to_vp(VALUE_PAIR **out, REQUEST *request,
-		    vp_tmpl_t const *vpt, fr_dict_attr_t const *cast)
-{
-	int		rcode;
-	VALUE_PAIR	*vp;
-	char		*p;
-
-	TMPL_VERIFY(vpt);
-
-	*out = NULL;
-
-	MEM(vp = fr_pair_afrom_da(request, cast));
-	if (tmpl_is_data(vpt)) {
-		VP_VERIFY(vp);
-		fr_assert(vp->vp_type == tmpl_value_type(vpt));
-
-		fr_value_box_copy(vp, &vp->data, tmpl_value(vpt));
-		*out = vp;
-		return 0;
-	}
-
-	rcode = tmpl_aexpand(vp, &p, request, vpt, NULL, NULL);
-	if (rcode < 0) {
-		fr_pair_list_free(&vp);
-		return rcode;
-	}
-
-	/*
-	 *	New escapes: strings are in binary form.
-	 */
-	if (vp->vp_type == FR_TYPE_STRING) {
-		fr_pair_value_strdup(vp, p);
-	} else if (fr_pair_value_from_str(vp, p, rcode, '\0', false) < 0) {
-		talloc_free(p);
-		fr_pair_list_free(&vp);
-		return -1;
-	}
-
-	*out = vp;
 	return 0;
 }
 
@@ -2130,13 +2051,13 @@ ssize_t _tmpl_to_type(void *out,
 		      fr_type_t dst_type)
 {
 	fr_value_box_t		value_to_cast;
-	fr_value_box_t		value_from_cast;
+	fr_value_box_t		value_from_cast = { .type = FR_TYPE_INVALID };
 	fr_value_box_t const	*to_cast = &value_to_cast;
 	fr_value_box_t const	*from_cast = &value_from_cast;
 
 	VALUE_PAIR		*vp = NULL;
 
-	fr_type_t		src_type = FR_TYPE_STRING;
+	fr_type_t		src_type = FR_TYPE_INVALID;
 
 	ssize_t			slen = -1;	/* quiet compiler */
 
@@ -2145,14 +2066,11 @@ ssize_t _tmpl_to_type(void *out,
 	fr_assert(!tmpl_is_list(vpt));
 	fr_assert(!buff || (bufflen >= 2));
 
-	memset(&value_to_cast, 0, sizeof(value_to_cast));
-	memset(&value_from_cast, 0, sizeof(value_from_cast));
-
 	switch (vpt->type) {
 	case TMPL_TYPE_UNPARSED:
 		RDEBUG4("EXPAND TMPL UNPARSED");
-		value_to_cast.vb_strvalue = vpt->name;
-		value_to_cast.datum.length = vpt->len;
+		fr_value_box_bstrndup_shallow(&value_to_cast, NULL, vpt->name, vpt->len, false);
+		src_type = FR_TYPE_STRING;
 		break;
 
 	case TMPL_TYPE_EXEC:
@@ -2165,12 +2083,15 @@ ssize_t _tmpl_to_type(void *out,
 
 		if (radius_exec_program(request, (char *)buff, bufflen, NULL, request, vpt->name, NULL,
 					true, false, fr_time_delta_from_sec(EXEC_TIMEOUT)) != 0) return -1;
-		value_to_cast.vb_strvalue = (char *)buff;
-		value_to_cast.datum.length = strlen((char *)buff);
+		fr_value_box_strdup_shallow(&value_to_cast, NULL, (char *)buff, true);
+		src_type = FR_TYPE_STRING;
 	}
 		break;
 
 	case TMPL_TYPE_XLAT_UNPARSED:
+	{
+		size_t len;
+
 		RDEBUG4("EXPAND TMPL XLAT");
 		if (!buff) {
 			fr_strerror_printf("Missing expansion buffer for XLAT");
@@ -2186,12 +2107,17 @@ ssize_t _tmpl_to_type(void *out,
 		 *
 		 *	@fixme We need a way of signalling xlat not to escape things.
 		 */
-		value_to_cast.datum.length = fr_value_str_unescape(buff, (char *)buff, slen, '"');
-		value_to_cast.vb_strvalue = (char *)buff;
+		len = fr_value_str_unescape(buff, (char *)buff, slen, '"');
+		fr_value_box_bstrndup_shallow(&value_to_cast, NULL, (char *)buff, len, true);
+		src_type = FR_TYPE_STRING;
+	}
 		break;
 
 	case TMPL_TYPE_XLAT:
-		RDEBUG4("EXPAND TMPL XLAT STRUCT");
+	{
+		size_t len;
+
+		RDEBUG4("EXPAND TMPL XLAT PARSED");
 		RDEBUG2("EXPAND %s", vpt->name); /* xlat_struct doesn't do this */
 		if (!buff) {
 			fr_strerror_printf("Missing expansion buffer for XLAT_STRUCT");
@@ -2209,9 +2135,10 @@ ssize_t _tmpl_to_type(void *out,
 		 *
 		 *	@fixme We need a way of signalling xlat not to escape things.
 		 */
-		value_to_cast.datum.length = fr_value_str_unescape(buff, (char *)buff, slen, '"');
-		value_to_cast.vb_strvalue = (char *)buff;
-
+		len = fr_value_str_unescape(buff, (char *)buff, slen, '"');
+		fr_value_box_bstrndup_shallow(&value_to_cast, NULL, (char *)buff, len, true);
+		src_type = FR_TYPE_STRING;
+	}
 		break;
 
 	case TMPL_TYPE_ATTR:
@@ -2281,16 +2208,17 @@ ssize_t _tmpl_to_type(void *out,
 				fr_strerror_printf("Missing expansion buffer for octet->string cast");
 				return -1;
 			}
-			if (bufflen <= to_cast->datum.length) {
+			if (bufflen <= to_cast->vb_length) {
 				fr_strerror_printf("Expansion buffer too small.  "
 						   "Have %zu bytes, need %zu bytes", bufflen,
-						   to_cast->datum.length + 1);
+						   to_cast->vb_length + 1);
 				return -1;
 			}
-			memcpy(buff, to_cast->vb_octets, to_cast->datum.length);
-			buff[to_cast->datum.length] = '\0';
-			value_from_cast.vb_strvalue = (char *)buff;
-			value_from_cast.datum.length = to_cast->datum.length;
+			memcpy(buff, to_cast->vb_octets, to_cast->vb_length);
+			buff[to_cast->vb_length] = '\0';
+
+			fr_value_box_bstrndup_shallow(&value_from_cast, NULL,
+						      (char *)buff, to_cast->vb_length, true);
 			break;
 
 		/*
@@ -2342,15 +2270,17 @@ ssize_t _tmpl_to_type(void *out,
 				talloc_free(ctx);
 				return -1;
 			}
-			if (from_cast->datum.length >= bufflen) {
+			if (from_cast->vb_length >= bufflen) {
 				fr_strerror_printf("Expansion buffer too small.  "
 						   "Have %zu bytes, need %zu bytes", bufflen,
-						   from_cast->datum.length + 1);
+						   from_cast->vb_length + 1);
 				goto error;
 			}
-			memcpy(buff, from_cast->vb_strvalue, from_cast->datum.length);
-			buff[from_cast->datum.length] = '\0';
-			value_from_cast.vb_strvalue = (char *)buff;
+			memcpy(buff, from_cast->vb_strvalue, from_cast->vb_length);
+			buff[from_cast->vb_length] = '\0';
+
+			fr_value_box_bstrndup_shallow(&value_from_cast, NULL,
+						      (char *)buff, from_cast->vb_length, from_cast->tainted);
 			break;
 
 		case FR_TYPE_OCTETS:
@@ -2358,13 +2288,14 @@ ssize_t _tmpl_to_type(void *out,
 				fr_strerror_printf("Missing expansion buffer to store cast output");
 				goto error;
 			}
-			if (from_cast->datum.length > bufflen) {
+			if (from_cast->vb_length > bufflen) {
 				fr_strerror_printf("Expansion buffer too small.  "
-						   "Have %zu bytes, need %zu bytes", bufflen, from_cast->datum.length);
+						   "Have %zu bytes, need %zu bytes", bufflen, from_cast->vb_length);
 				goto error;
 			}
-			memcpy(buff, from_cast->vb_octets, from_cast->datum.length);
-			value_from_cast.vb_octets = buff;
+			memcpy(buff, from_cast->vb_octets, from_cast->vb_length);
+			fr_value_box_memdup_shallow(&value_from_cast, NULL,
+						    buff, from_cast->vb_length, from_cast->tainted);
 			break;
 
 		default:
@@ -2380,7 +2311,7 @@ ssize_t _tmpl_to_type(void *out,
 
 	memcpy(out, ((uint8_t const *) from_cast) + fr_value_box_offsets[dst_type], fr_value_box_field_sizes[dst_type]);
 
-	return from_cast->datum.length;
+	return from_cast->vb_length;
 }
 
 /** Expand a template to a string, allocing a new buffer to hold the string

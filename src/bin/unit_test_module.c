@@ -29,11 +29,6 @@ RCSID("$Id$")
 #include <freeradius-devel/server/map_proc.h>
 #include <freeradius-devel/server/module.h>
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/server/state.h>
-
-#include <freeradius-devel/radius/defs.h>
-#include <freeradius-devel/radius/radius.h>
-
 #include <freeradius-devel/util/rand.h>
 
 #include <freeradius-devel/tls/base.h>
@@ -62,17 +57,18 @@ static bool filedone = false;
 char const *radiusd_version = RADIUSD_VERSION_STRING_BUILD("unittest");
 
 static fr_dict_t const *dict_freeradius;
-static fr_dict_t const *dict_radius;
+static fr_dict_t const *dict_protocol;
+
+#define PROTOCOL_NAME unit_test_module_dict[1].proto
 
 extern fr_dict_autoload_t unit_test_module_dict[];
 fr_dict_autoload_t unit_test_module_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
-	{ .out = &dict_radius, .proto = "radius" },
+	{ .out = &dict_protocol, .proto = "radius" }, /* hacked in-place with '-p protocol' */
 	{ NULL }
 };
 
 static fr_dict_attr_t const *attr_auth_type;
-static fr_dict_attr_t const *attr_chap_password;
 static fr_dict_attr_t const *attr_packet_dst_ip_address;
 static fr_dict_attr_t const *attr_packet_dst_ipv6_address;
 static fr_dict_attr_t const *attr_packet_dst_port;
@@ -80,9 +76,6 @@ static fr_dict_attr_t const *attr_packet_src_ip_address;
 static fr_dict_attr_t const *attr_packet_src_ipv6_address;
 static fr_dict_attr_t const *attr_packet_src_port;
 static fr_dict_attr_t const *attr_packet_type;
-static fr_dict_attr_t const *attr_state;
-static fr_dict_attr_t const *attr_user_name;
-static fr_dict_attr_t const *attr_user_password;
 
 extern fr_dict_attr_autoload_t unit_test_module_dict_attr[];
 fr_dict_attr_autoload_t unit_test_module_dict_attr[] = {
@@ -93,14 +86,14 @@ fr_dict_attr_autoload_t unit_test_module_dict_attr[] = {
 	{ .out = &attr_packet_src_ip_address, .name = "Packet-Src-IP-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_freeradius },
 	{ .out = &attr_packet_src_ipv6_address, .name = "Packet-Src-IPv6-Address", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_freeradius },
 	{ .out = &attr_packet_src_port, .name = "Packet-Src-Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
+	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_protocol },
 
-	{ .out = &attr_chap_password, .name = "CHAP-Password", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
-	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_radius },
-	{ .out = &attr_state, .name = "State", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
-	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_radius },
-	{ .out = &attr_user_password, .name = "User-Password", .type = FR_TYPE_STRING, .dict = &dict_radius },
 	{ NULL }
 };
+
+static uint32_t access_request;
+static uint32_t access_accept;
+static uint32_t access_reject;
 
 /*
  *	Static functions.
@@ -164,9 +157,9 @@ static REQUEST *request_from_file(TALLOC_CTX *ctx, FILE *fp, fr_event_list_t *el
 	 *	FIXME - Should be less RADIUS centric, but everything
 	 *	else assumes RADIUS at the moment so we can fix this later.
 	 */
-	request->dict = fr_dict_by_protocol_name("radius");
+	request->dict = fr_dict_by_protocol_name(PROTOCOL_NAME);
 	if (!request->dict) {
-		ERROR("RADIUS dictionary failed to load");
+		ERROR("%s dictionary failed to load", PROTOCOL_NAME);
 		talloc_free(request);
 		return NULL;
 	}
@@ -200,7 +193,7 @@ static REQUEST *request_from_file(TALLOC_CTX *ctx, FILE *fp, fr_event_list_t *el
 	/*
 	 *	Read packet from fp
 	 */
-	if (fr_pair_list_afrom_file(request->packet, dict_radius, &request->packet->vps, fp, &filedone) < 0) {
+	if (fr_pair_list_afrom_file(request->packet, dict_protocol, &request->packet->vps, fp, &filedone) < 0) {
 		fr_perror("%s", main_config->name);
 		talloc_free(request);
 		return NULL;
@@ -209,7 +202,7 @@ static REQUEST *request_from_file(TALLOC_CTX *ctx, FILE *fp, fr_event_list_t *el
 	/*
 	 *	Set the defaults for IPs, etc.
 	 */
-	request->packet->code = FR_CODE_ACCESS_REQUEST;
+	request->packet->code = access_request;
 
 	request->packet->src_ipaddr.af = AF_INET;
 	request->packet->src_ipaddr.prefix = 32;
@@ -246,44 +239,6 @@ static REQUEST *request_from_file(TALLOC_CTX *ctx, FILE *fp, fr_event_list_t *el
 		} else if ((vp->da == attr_packet_src_ip_address) ||
 			   (vp->da == attr_packet_src_ipv6_address)) {
 			memcpy(&request->packet->src_ipaddr, &vp->vp_ip, sizeof(request->packet->src_ipaddr));
-		} else if (vp->da == attr_chap_password) {
-			int i, already_hex = 0;
-
-			/*
-			 *	If it's 17 octets, it *might* be already encoded.
-			 *	Or, it might just be a 17-character password (maybe UTF-8)
-			 *	Check it for non-printable characters.  The odds of ALL
-			 *	of the characters being 32..255 is (1-7/8)^17, or (1/8)^17,
-			 *	or 1/(2^51), which is pretty much zero.
-			 */
-			if (vp->vp_length == 17) {
-				for (i = 0; i < 17; i++) {
-					if (vp->vp_octets[i] < 32) {
-						already_hex = 1;
-						break;
-					}
-				}
-			}
-
-			/*
-			 *	Allow the user to specify ASCII or hex CHAP-Password
-			 */
-			if (!already_hex) {
-				uint8_t *p;
-				size_t len, len2;
-
-				len = len2 = vp->vp_length;
-				if (len2 < 17) len2 = 17;
-
-				p = talloc_zero_array(vp, uint8_t, len2);
-
-				memcpy(p, vp->vp_strvalue, len);
-
-				fr_radius_encode_chap_password(p, request->packet, fr_rand() & 0xff,
-							       vp->vp_strvalue, vp->vp_length);
-				vp->vp_octets = p;
-				vp->vp_length = 17;
-			}
 		}
 	} /* loop over the VP's we read in */
 
@@ -308,7 +263,7 @@ static REQUEST *request_from_file(TALLOC_CTX *ctx, FILE *fp, fr_event_list_t *el
 	/*
 	 *	FIXME: set IPs, etc.
 	 */
-	request->packet->code = FR_CODE_ACCESS_REQUEST;
+	request->packet->code = access_request;
 
 	request->packet->src_ipaddr.af = AF_INET;
 	request->packet->src_ipaddr.prefix = 32;
@@ -510,14 +465,18 @@ static void process(REQUEST *request)
 	VALUE_PAIR		*vp;
 	char			*auth_type;
 	fr_dict_enum_t const	*dv = NULL;
+
 	/*
 	 *	Simulate an authorize section
 	 */
 	fr_assert(request->server_cs != NULL);
-	unlang = cf_section_find(request->server_cs, "recv", "Access-Request");
+	dv = fr_dict_enum_by_value(attr_packet_type, fr_box_uint32(request->packet->code));
+	if (!dv) return;
+
+	unlang = cf_section_find(request->server_cs, "recv", dv->name);
 	if (!unlang) {
-		REDEBUG("Failed to find 'recv Access-Request' section");
-		request->reply->code = FR_CODE_ACCESS_REJECT;
+		REDEBUG("Failed to find 'recv %s' section", dv->name);
+		request->reply->code = access_reject;
 		goto send_reply;
 	}
 
@@ -525,11 +484,11 @@ static void process(REQUEST *request)
 	case RLM_MODULE_OK:
 	case RLM_MODULE_UPDATED:
 	case RLM_MODULE_NOOP:
-		request->reply->code = FR_CODE_ACCESS_ACCEPT;
+		request->reply->code = access_accept;
 		break;
 
 	default:
-		request->reply->code = FR_CODE_ACCESS_REJECT;
+		request->reply->code = access_reject;
 		goto send_reply;
 	}
 
@@ -541,11 +500,11 @@ static void process(REQUEST *request)
 
 	switch (vp->vp_int32) {
 	case FR_AUTH_TYPE_VALUE_ACCEPT:
-		request->reply->code = FR_CODE_ACCESS_ACCEPT;
+		request->reply->code = access_accept;
 		goto send_reply;
 
 	case FR_AUTH_TYPE_VALUE_REJECT:
-		request->reply->code = FR_CODE_ACCESS_REJECT;
+		request->reply->code = access_reject;
 		goto send_reply;
 
 	default:
@@ -557,7 +516,7 @@ static void process(REQUEST *request)
 	talloc_free(auth_type);
 	if (!unlang) {
 		REDEBUG("Failed to find 'recv %pV' section", &vp->data);
-		request->reply->code = FR_CODE_ACCESS_REJECT;
+		request->reply->code = access_reject;
 		goto send_reply;
 	}
 
@@ -565,11 +524,11 @@ static void process(REQUEST *request)
 	case RLM_MODULE_OK:
 	case RLM_MODULE_UPDATED:
 	case RLM_MODULE_NOOP:
-		request->reply->code = FR_CODE_ACCESS_ACCEPT;
+		request->reply->code = access_accept;
 		break;
 
 	default:
-		request->reply->code = FR_CODE_ACCESS_REJECT;
+		request->reply->code = access_reject;
 		break;
 	}
 
@@ -585,7 +544,7 @@ send_reply:
 		break;
 
 	case RLM_MODULE_REJECT:
-		request->reply->code = FR_CODE_ACCESS_REJECT;
+		request->reply->code = access_reject;
 		break;
 	}
 }
@@ -624,7 +583,6 @@ int main(int argc, char *argv[])
 	VALUE_PAIR		*vp;
 	VALUE_PAIR		*filter_vps = NULL;
 	bool			xlat_only = false;
-	fr_state_tree_t		*state = NULL;
 	fr_event_list_t		*el = NULL;
 	RADCLIENT		*client = NULL;
 	fr_dict_t		*dict = NULL;
@@ -736,6 +694,10 @@ int main(int argc, char *argv[])
 				fprintf(stderr, "Unknown option '%s'\n", optarg);
 				fr_exit_now(EXIT_FAILURE);
 
+			case 'p':
+				PROTOCOL_NAME = optarg;
+				break;
+
 			case 'r':
 				receipt_file = optarg;
 				break;
@@ -834,6 +796,13 @@ int main(int argc, char *argv[])
 		EXIT_WITH_FAILURE;
 	}
 
+	/*
+	 *	@todo - generalize these names for different protocols.
+	 */
+	access_request = FR_CODE_ACCESS_REQUEST;
+	access_accept = FR_CODE_ACCESS_ACCEPT;
+	access_reject = FR_CODE_ACCESS_REJECT;
+
 	if (map_proc_register(NULL, "test-fail", mod_map_proc, map_proc_verify, 0) < 0) {
 		EXIT_WITH_FAILURE;
 	}
@@ -873,33 +842,6 @@ int main(int argc, char *argv[])
 	}
 
 	/*
-	 *	Setup dummy virtual server
-	 */
-	{
-		CONF_SECTION	*server;
-		CONF_PAIR	*namespace;
-		fr_dict_t	*ns_dict;
-		fr_dict_t	**dict_p;
-
-		server = cf_section_alloc(config->root_cs, config->root_cs, "server", "unit_test");
-		cf_section_add(config->root_cs, server);
-
-		namespace = cf_pair_alloc(server, "namespace", "radius",
-					  T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
-		cf_pair_add(server, namespace);
-
-		if (fr_dict_protocol_afrom_file(&ns_dict, cf_pair_value(namespace), NULL) < 0) {
-			cf_log_perr(server, "Failed initialising namespace \"%s\"", cf_pair_value(namespace));
-			return -1;
-		}
-
-		dict_p = talloc_zero(NULL, fr_dict_t *);
-		*dict_p = ns_dict;
-
-		cf_data_add(server, dict_p, "dictionary", true);
-	}
-
-	/*
 	 *	Initialise the interpreter, registering operations.
 	 */
 	if (unlang_init() < 0) return -1;
@@ -917,8 +859,6 @@ int main(int argc, char *argv[])
 	 */
 	if (modules_thread_instantiate(thread_ctx, el) < 0) EXIT_WITH_FAILURE;
 	if (xlat_thread_instantiate(thread_ctx) < 0) EXIT_WITH_FAILURE;
-
-	state = fr_state_tree_init(autofree, attr_state, false, 256, 10, 0);
 
 	/*
 	 *  Set the panic action (if required)
@@ -995,7 +935,7 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		if (fr_pair_list_afrom_file(request, dict_radius, &filter_vps, fp, &filedone) < 0) {
+		if (fr_pair_list_afrom_file(request, dict_protocol, &filter_vps, fp, &filedone) < 0) {
 			fr_perror("Failed reading attributes from %s", filter_file);
 			EXIT_WITH_FAILURE;
 		}
@@ -1063,7 +1003,6 @@ int main(int argc, char *argv[])
 
 cleanup:
 	talloc_free(request);
-	talloc_free(state);
 
 	/*
 	 *	Free thread data
@@ -1137,6 +1076,9 @@ static void NEVER_RETURNS usage(main_config_t const *config, int status)
 	fprintf(output, "  -i <file>          File containing request attributes.\n");
 	fprintf(output, "  -m                 On SIGINT or SIGQUIT exit cleanly instead of immediately.\n");
 	fprintf(output, "  -n <name>          Read raddb/name.conf instead of raddb/radiusd.conf.\n");
+	fprintf(output, "  -o <file>          Output file for the reply.\n");
+	fprintf(output, "  -p <radius|...>    Define which protocol namespace is used to read the file\n");
+	fprintf(output, "                     Use radius, dhcpv4, or dhcpv6\n");
 	fprintf(output, "  -X                 Turn on full debugging.\n");
 	fprintf(output, "  -x                 Turn on additional debugging. (-xx gives more debugging).\n");
 	fprintf(output, "  -r <receipt_file>  Create the <receipt_file> as a 'success' exit.\n");

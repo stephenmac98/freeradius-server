@@ -32,6 +32,21 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <ifaddrs.h>
+
+#ifdef HAVE_LINUX_IF_PACKET_H
+#  include <linux/if_packet.h>
+#  include <linux/if_ether.h>
+#endif
+
+#include <net/if_arp.h>
+
+/*
+ *	Apple, *BSD
+ */
+#ifndef __linux__
+#include <net/if_dl.h>
+#endif
 
 bool fr_reverse_lookups = false;		//!< IP -> hostname lookups?
 bool fr_hostname_lookups = true;		//!< hostname -> IP lookups?
@@ -1325,4 +1340,124 @@ int fr_ipaddr_from_sockaddr(struct sockaddr_storage const *sa, socklen_t salen,
 	}
 
 	return 0;
+}
+
+char *fr_ipaddr_to_interface(TALLOC_CTX *ctx, fr_ipaddr_t *ipaddr)
+{
+	struct ifaddrs *list = NULL;
+	struct ifaddrs *i;
+	char *interface = NULL;
+
+	/*
+	 *	Bind manually to an IP used by the named interface.
+	 */
+	if (getifaddrs(&list) < 0) return NULL;
+
+	for (i = list; i != NULL; i = i->ifa_next) {
+		int scope_id;
+		fr_ipaddr_t my_ipaddr;
+
+		if (!i->ifa_addr || !i->ifa_name || (ipaddr->af != i->ifa_addr->sa_family)) continue;
+
+		fr_ipaddr_from_sockaddr((struct sockaddr_storage *)i->ifa_addr, sizeof(struct sockaddr_in6), &my_ipaddr, NULL);
+
+		/*
+		 *	my_ipaddr will have a scope_id, but the input
+		 *	ipaddr won't have one.  We therefore set the
+		 *	local one to zero, so that we can do correct
+		 *	IP address comparisons.
+		 *
+		 *	If the comparison succeeds, then we return
+		 *	both the interface name, and we update the
+		 *	input ipaddr with the correct scope_id.
+		 */
+		scope_id = my_ipaddr.scope_id;
+		my_ipaddr.scope_id = 0;
+		if (fr_ipaddr_cmp(ipaddr, &my_ipaddr) == 0) {
+			interface = talloc_strdup(ctx, i->ifa_name);
+			ipaddr->scope_id = scope_id;
+			break;
+		}
+	}
+
+	freeifaddrs(list);
+	return interface;
+}
+
+int fr_interface_to_ipaddr(char const *interface, fr_ipaddr_t *ipaddr, int af, bool link_local)
+{
+	struct ifaddrs *list = NULL;
+	struct ifaddrs *i;
+	int rcode = -1;
+
+	if (getifaddrs(&list) < 0) return -1;
+
+	for (i = list; i != NULL; i = i->ifa_next) {
+		fr_ipaddr_t my_ipaddr;
+
+		if (!i->ifa_addr || !i->ifa_name || (af != i->ifa_addr->sa_family)) continue;
+		if (strcmp(i->ifa_name, interface) != 0) continue;
+
+		fr_ipaddr_from_sockaddr((struct sockaddr_storage *)i->ifa_addr, sizeof(struct sockaddr_in6), &my_ipaddr, NULL);
+
+		/*
+		 *	If we ask for a link local address, then give
+		 *	it to them.
+		 */
+		if (link_local) {
+			if (af != AF_INET6) continue;
+			if (!IN6_IS_ADDR_LINKLOCAL(&my_ipaddr.addr.v6)) continue;
+		}
+
+		*ipaddr = my_ipaddr;
+		rcode = 0;
+		break;
+	}
+
+	freeifaddrs(list);
+	return rcode;
+}
+
+/*
+ *	AF_PACKET on Linux
+ *	AF_LINK on BSD
+ */
+#ifndef AF_LINK
+#define AF_LINK AF_PACKET
+#endif
+
+int fr_interface_to_ethernet(char const *interface, uint8_t ethernet[static 6])
+{
+	struct ifaddrs *list = NULL;
+	struct ifaddrs *i;
+	int rcode = -1;
+
+	if (getifaddrs(&list) < 0) return -1;
+
+	for (i = list; i != NULL; i = i->ifa_next) {
+		if (!i->ifa_addr || !i->ifa_name || (i->ifa_addr->sa_family != AF_LINK)) continue;
+		if (strcmp(i->ifa_name, interface) != 0) continue;
+
+#ifdef __linux__
+		struct sockaddr_ll *ll;
+
+		ll = (struct sockaddr_ll *) i->ifa_addr;
+		if ((ll->sll_hatype != 1) || (ll->sll_halen != 6)) continue;
+
+		memcpy(ethernet, ll->sll_addr, 6);
+
+#else
+		struct sockaddr_dl *ll;
+
+		ll = (struct sockaddr_dl *) i->ifa_addr;
+		if (ll->sdl_alen != 6) continue;
+
+		memcpy(ethernet, LLADDR(ll), 6);
+#endif
+		rcode = 0;
+		break;
+	}
+
+	freeifaddrs(list);
+	return rcode;
 }

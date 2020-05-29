@@ -31,10 +31,30 @@ RCSIDH(inet_h, "$Id$")
 #include <net/if.h>		/* SIOCGIFADDR et al */
 #include <netinet/in.h>		/* in6?_addr */
 #include <stdbool.h>
+#include <talloc.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/** Struct to represent an ethernet address
+ *
+ * This is needed to represent ethernet addresses correctly in
+ * _Generic macros.
+ */
+typedef struct {
+	uint8_t		addr[6];		//!< Ethernet address.
+} fr_ethernet_t;
+
+/** Struct to represent an interface id
+ *
+ * This is needed to represent an interface id correctly in
+ * _Generic macros.
+ */
+typedef struct {
+	uint8_t		addr[8];		//!< Interface ID.
+} fr_ifid_t;
+
 /** IPv4/6 prefix
  *
  * Abstraction around the standard in_addr/in6_addr structures to
@@ -137,6 +157,10 @@ char	*fr_ifname_from_ifindex(char out[static IFNAMSIZ], int if_index);
 int	fr_ipaddr_from_ifindex(fr_ipaddr_t *out, int fd, int af, int if_index);
 #endif
 
+char	*fr_ipaddr_to_interface(TALLOC_CTX *ctx, fr_ipaddr_t *ipaddr);
+int	fr_interface_to_ipaddr(char const *interface, fr_ipaddr_t *ipaddr, int af, bool link_local);
+
+int	fr_interface_to_ethernet(char const *interface, uint8_t ethernet[static 6]);
 /*
  *	Comparison
  */
