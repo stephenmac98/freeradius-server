@@ -69,3 +69,4 @@ echo "Setting up fixtures"
 ./scripts/travis/mysql-setup.sh
 ./scripts/travis/ldap-setup.sh
 ./scripts/travis/redis-setup.sh
+./scripts/travis/imap-setup.sh
