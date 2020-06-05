@@ -1,3 +1,0 @@
-#
-#  Test the "icmp" module
-#
