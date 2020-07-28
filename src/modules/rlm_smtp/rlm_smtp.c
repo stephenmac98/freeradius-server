@@ -47,7 +47,6 @@ static fr_dict_attr_t 	const 	*attr_smtp_sender_email;
 static fr_dict_attr_t 	const 	*attr_smtp_recipients;
 static fr_dict_attr_t 	const 	*attr_smtp_attachment_file;
 
-
 extern fr_dict_attr_autoload_t rlm_smtp_dict_attr[];
 fr_dict_attr_autoload_t rlm_smtp_dict_attr[] = {
 	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_radius },
@@ -72,21 +71,20 @@ typedef struct {
 	rlm_smtp_t const    	*inst;		//!< Instance of rlm_smtp.
 	fr_curl_handle_t    	*mhandle;	//!< Thread specific multi handle.  Serves as the dispatch and coralling structure for smtp requests
 } rlm_smtp_thread_t;
+
 /*
  *	Holds the context for parsing the email elements
  */
-// typedef struct mail_ctx_t;
-// typedef struct mail_ctx_s {};
 typedef struct {
 	REQUEST			*request;
 	fr_curl_io_request_t	*randle;
 	fr_cursor_t		cursor;
+	fr_cursor_t		mime_cursor;
 	fr_dbuff_t		vp_in;
-	fr_dbuff_t		le_in;
 	struct curl_slist	*recipients;
 	struct curl_slist	*header;
+	struct curl_slist 	*body_header;
 	fr_time_t 		time;
-	size_t 			(* function_source)(char *ptr, size_t size, size_t nmemb, void *uctx);
 	char 			time_str[60];
 	enum { UNLOADED,
 		LOADED}		time_status ;
@@ -109,62 +107,82 @@ static int recipients_source(fr_mail_ctx *uctx)
 {
 	REQUEST			*request = uctx->request;
 	VALUE_PAIR 		*vp;
+	int 			recipients_set = 0;
 
+	RDEBUG2("Generating the curl_slist for the recipients");
 	fr_cursor_iter_by_da_init(&uctx->cursor, &uctx->request->packet->vps, attr_smtp_recipients);
 
 	for ( vp = fr_cursor_current(&uctx->cursor); vp; vp = fr_cursor_next(&uctx->cursor)) {
+		recipients_set++;
 		RDEBUG2("Adding Recipient: %s", vp->vp_strvalue);
 		uctx->recipients = curl_slist_append(uctx->recipients, vp->vp_strvalue);
 	}
-	if ( uctx->recipients == NULL) {
-		RDEBUG2("Recipients could not be found");
- 		return -1;
-	}
-	return 0;
+	RDEBUG2("Finished generating the curl_slist for %d recipients", recipients_set);
+	return recipients_set;
 }
+
 /*
- *	Generates a curl_slist of recipients
+ *	Generates a curl_slist of header elements header elements
  */
-static int header_slist_source(fr_mail_ctx *uctx)
+static int header_source(fr_mail_ctx *mail_ctx)
 {
-	REQUEST			*request = uctx->request;
+	fr_sbuff_t 		time_out;
+	char const 		*date = "DATE:";
+	REQUEST			*request = mail_ctx->request;
 	VALUE_PAIR 		*vp;
-
-	fr_cursor_iter_by_da_init(&uctx->cursor, &uctx->request->packet->vps,attr_smtp_header);
-	RDEBUG2("RUNNING");
-
-	for ( vp = fr_cursor_current(&uctx->cursor); vp; vp = fr_cursor_next(&uctx->cursor)) {
+	RDEBUG2("Generating the curl_slist for the header elements");
+	fr_cursor_iter_by_da_init(&mail_ctx->cursor, &mail_ctx->request->packet->vps, attr_smtp_header);
+	/* Loop through all of the header elements and append them to a curl slist */
+	for ( vp = fr_cursor_current(&mail_ctx->cursor); vp; vp = fr_cursor_next(&mail_ctx->cursor)) {
+		if (strncmp(vp->vp_strvalue, date, 5) == 0) {
+			RDEBUG2("date set manually to: %s", vp->vp_strvalue);
+			mail_ctx->time_status = LOADED;
+		}
 		RDEBUG2("Adding Header: %s", vp->vp_strvalue);
-		uctx->header = curl_slist_append(uctx->header, vp->vp_strvalue);
+		mail_ctx->header = curl_slist_append(mail_ctx->header, vp->vp_strvalue);
 	}
-	if ( uctx->header == NULL) {
+	/* If no header elements could be found, there is an error */
+	if ( mail_ctx->header == NULL) {
 		RDEBUG2("Header could not be found");
  		return -1;
 	}
+	/* If no time stamp was specified, add the time that the modules initially received the request */
+	if (mail_ctx->time_status == UNLOADED){
+		time_out = FR_SBUFF_TMP(mail_ctx->time_str, sizeof(mail_ctx->time_str));
+		RDEBUG2("The user supplied header elements have been added, preparing the time");
+		fr_time_strftime_local(&time_out, fr_time(), "DATE: %a, %d %b %Y %T %z, (%Z) \r\n");
+		RDEBUG2("Adding Header: %s", mail_ctx->time_str);
+		mail_ctx->header = curl_slist_append(mail_ctx->header, mail_ctx->time_str);
+	}
+	RDEBUG2("Finished generating the curl_slist for the header elements");
 	return 0;
 }
+
+/*
+ * Adds every SMTP_Attachments file to the email as a MIME part
+ */
 static int attachments_source(fr_mail_ctx *uctx, curl_mime *mime)
 {
 	curl_mimepart		*part;
 	REQUEST			*request = uctx->request;
 	VALUE_PAIR 		*vp;
 	int 			attachments_set = 0;
-	fr_cursor_iter_by_da_init(&uctx->cursor, &uctx->request->packet->vps, attr_smtp_attachment_file);
 
-	for ( vp = fr_cursor_current(&uctx->cursor); vp; vp = fr_cursor_next(&uctx->cursor)) {
+	vp = fr_cursor_iter_by_da_init(&uctx->cursor, &uctx->request->packet->vps, attr_smtp_attachment_file);
+
+	/* Check for any file attachments */
+	while(vp) {
 		attachments_set++;
-		RDEBUG2("Adding Attachment: %s", vp->vp_strvalue);
+		RDEBUG2("ititializing attachment: %s", vp->vp_strvalue);
 		part = curl_mime_addpart(mime);
-		curl_mime_type(part, "multipart/alternative");
+		curl_mime_encoder(part, "base64");
 		curl_mime_filedata(part, vp->vp_strvalue);
+		vp = fr_cursor_next(&uctx->cursor);
 	}
-	part = curl_mime_addpart(mime);
-	curl_mime_data(part, "hypothetical body line", CURL_ZERO_TERMINATED);
-	part = curl_mime_addpart(mime);
-	curl_mime_data(part, "hypothetical body line 2", CURL_ZERO_TERMINATED);
-	RDEBUG2("%d Attachments were found", attachments_set);
+	RDEBUG2("Ititialized %d attachment(s)", attachments_set);
 	return attachments_set;
 }
+
 /*
  * Add the Body elements to the email
  */
@@ -174,78 +192,35 @@ static size_t body_source(char *ptr, size_t size, size_t nmemb, void *uctx)
 	fr_dbuff_t		out;
 	REQUEST			*request = mail_ctx->request;
 	VALUE_PAIR 		*vp;
-	static char const 	*le = "\r\n";
-	RDEBUG2("inside body_source");
-	fr_dbuff_init(&out, (uint8_t *)ptr, (size * nmemb));  /* Wrap the output buffer so we can track our position easily */
-	RDEBUG2("dbuff initialized");
-	while (true) {
-		if (fr_dbuff_memcpy_in_partial(&out, &mail_ctx->vp_in, SIZE_MAX) < fr_dbuff_remaining(&mail_ctx->vp_in)) return fr_dbuff_used(&out);
-		if (fr_dbuff_memcpy_in_partial(&out, &mail_ctx->le_in, SIZE_MAX) < fr_dbuff_remaining(&mail_ctx->le_in)) return fr_dbuff_used(&out);
-		vp = fr_cursor_next(&mail_ctx->cursor);
-		if (!vp) break;
-		fr_dbuff_init(&mail_ctx->vp_in, (uint8_t const *)vp->vp_strvalue, vp->vp_length);
-		fr_dbuff_init(&mail_ctx->le_in, (uint8_t const *)le, 2*sizeof(unsigned char));
-	}
-	return fr_dbuff_used(&out);
-}
-/*
- * Add the header elements to the email
- */
-static size_t header_source(char *ptr, size_t size, size_t nmemb, void *uctx)
-{
-	fr_mail_ctx 		*mail_ctx = uctx;
-	fr_dbuff_t		out;
-	fr_sbuff_t 		time_out;
-	REQUEST			*request = mail_ctx->request;
-	VALUE_PAIR 		*vp;
-	static char const 	*le = "\r\n";
-	char const 		*date = "DATE:";
-	fr_dbuff_init(&out, (uint8_t *)ptr, (size * nmemb));  /* Wrap the output buffer so we can track our position easily */
-	RDEBUG2("dbuff initialized");
-	vp = fr_cursor_current(&mail_ctx->cursor);
-	while (true) {
-		if (strncmp(vp->vp_strvalue, date, 5) == 0) {
-			RDEBUG2("date set manually to: %s", vp->vp_strvalue);
-			mail_ctx->time_status = LOADED;
-		}
-		if (fr_dbuff_memcpy_in_partial(&out, &mail_ctx->vp_in, SIZE_MAX) < fr_dbuff_remaining(&mail_ctx->vp_in)) return fr_dbuff_used(&out);
-		if (fr_dbuff_memcpy_in_partial(&out, &mail_ctx->le_in, SIZE_MAX) < fr_dbuff_remaining(&mail_ctx->le_in)) return fr_dbuff_used(&out);
-		vp = fr_cursor_next(&mail_ctx->cursor);
-		if (!vp) break;
-		fr_dbuff_init(&mail_ctx->le_in, (uint8_t const *)le, 2*sizeof(unsigned char));
-		fr_dbuff_init(&mail_ctx->vp_in, (uint8_t const *)vp->vp_strvalue, vp->vp_length);
-	}
-	/* Add the time this module was called as the timestamp of the email*/
-	time_out = FR_SBUFF_TMP(mail_ctx->time_str, sizeof(mail_ctx->time_str));
-	if (mail_ctx->time_status == UNLOADED){
-		RDEBUG2("The user supplied header elements have been added, preparing the time");
-		fr_time_strftime_local(&time_out, fr_time(), "DATE: %a, %d %b %Y %T %z, (%Z) \r\n");
-		mail_ctx->time_status = LOADED;
-		fr_dbuff_init(&mail_ctx->vp_in, (uint8_t const *)mail_ctx->time_str, strlen(mail_ctx->time_str));
-		RDEBUG2("The time has been set to: %s", mail_ctx->time_str);
-		if (fr_dbuff_memcpy_in_partial(&out, &mail_ctx->vp_in, SIZE_MAX) < fr_dbuff_remaining(&mail_ctx->vp_in)) return fr_dbuff_used(&out);
-		RDEBUG2("The header elements have been added");
-	}
-	/* Add the final line end to indicate that the header elements are over */
-	if (fr_dbuff_memcpy_in_partial(&out, &mail_ctx->le_in, SIZE_MAX) < fr_dbuff_remaining(&mail_ctx->le_in)) return fr_dbuff_used(&out);
 
-	/* Prepare to load in the body elements */
-	RDEBUG2("Switching to body_source");
-	vp = fr_cursor_iter_by_da_init(&mail_ctx->cursor, &mail_ctx->request->packet->vps, attr_smtp_body);
-	fr_dbuff_init(&mail_ctx->vp_in, (uint8_t const *)vp->vp_strvalue, vp->vp_length);
-	fr_dbuff_init(&mail_ctx->le_in, (uint8_t const *)le, 2*sizeof(unsigned char));
-	mail_ctx->function_source = body_source;
+	fr_dbuff_init(&out, (uint8_t *)ptr, (size * nmemb));  /* Wrap the output buffer so we can track our position easily */
+	vp = fr_cursor_current(&mail_ctx->mime_cursor);
+	/* Copy the vp into the email. If it cannot all be loaded, return the amount of memory that was loaded and get called again */
+	if (fr_dbuff_memcpy_in_partial(&out, &mail_ctx->vp_in, SIZE_MAX) < fr_dbuff_remaining(&mail_ctx->vp_in)) {
+		RDEBUG2("%zu bytes used (partial copy)", fr_dbuff_used(&out));
+		return fr_dbuff_used(&out);
+	}
+	/* Once this value pair is fully copied, prepare for the next element */
+	vp = fr_cursor_next(&mail_ctx->mime_cursor);
+	if (vp) {
+		fr_dbuff_init(&mail_ctx->vp_in, (uint8_t const *)vp->vp_strvalue, vp->vp_length);
+
+	}
+	RDEBUG2("%zu bytes used (full copy)", fr_dbuff_used(&out));
 	return fr_dbuff_used(&out);
 }
+
 /*
- * cURL does not allow changing of the source function mid request,
- * This function is simply to aggregate the header and body functions
- * into a single callable function
+ * Free the curl slists
  */
-static size_t email_source(char *ptr, size_t size, size_t nmemb, fr_mail_ctx *uctx)
+static int _free_mail_slists(fr_mail_ctx *uctx)
 {
-	return uctx->function_source(ptr, size, nmemb, uctx);
+	curl_slist_free_all(uctx->header);
+	curl_slist_free_all(uctx->body_header);
+	curl_slist_free_all(uctx->recipients);
+	return 0;
 }
+
 /*
  * Check if the email was successfully sent, and if the certificate information was extracted
  */
@@ -257,11 +232,7 @@ static rlm_rcode_t mod_authorize_result(module_ctx_t const *mctx, REQUEST *reque
 	fr_curl_tls_t const		*tls;
 	long 				curl_out;
 	long				curl_out_valid;
-
 	tls = &inst->tls;
-
-	curl_slist_free_all(mail_ctx->recipients);
-	curl_slist_free_all(mail_ctx->header);
 
 	curl_out_valid = curl_easy_getinfo(randle->candle, CURLINFO_SSL_VERIFYRESULT, &curl_out);
 	if (curl_out_valid == CURLE_OK){
@@ -280,9 +251,20 @@ static rlm_rcode_t mod_authorize_result(module_ctx_t const *mctx, REQUEST *reque
 	talloc_free(randle);
 	return RLM_MODULE_OK;
 }
+
 /*
- *	Check to see if there is enough information to establish a login and to send an email
- *	If there is, attempt to send the email
+ *	Checks that there is a User-Name and User-Password field in the request
+ *	As well as all of the required SMTP elements
+ *	Sets the: username, password
+ *		website URI
+ *		timeout information
+ *		TLS information
+ *		Sender and recipient information
+ *		Email header and body
+ *		File attachments
+ *
+ *	Then it queues the request and yeilds until a response is given
+ *	When it responds, mod_authorize_resume is called.
  */
 static rlm_rcode_t CC_HINT(nonnull) mod_authorize(module_ctx_t const *mctx, REQUEST *request)
 {
@@ -291,15 +273,16 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(module_ctx_t const *mctx, REQU
 	fr_curl_io_request_t     	*randle;
 	fr_mail_ctx			*mail_ctx;
 	curl_mime			*mime;
+	curl_mime			*mime_body;
+	curl_mimepart			*part;
+	int 				body_elements;
 
 	VALUE_PAIR const 		*vp, *smtp_header, *smtp_body, *sender_email, *username, *password;
-	static char const 		*le = "\r\n";
 
 	if (fr_pair_find_by_da(request->control, attr_auth_type, TAG_ANY) != NULL) {
 		RDEBUG3("Auth-Type is already set.  Not setting 'Auth-Type := %s'", inst->name);
 		return RLM_MODULE_NOOP;
 	}
-	//TODO: talloc set destructor
 	username = fr_pair_find_by_da(request->packet->vps, attr_user_name, TAG_ANY);
 	password = fr_pair_find_by_da(request->packet->vps, attr_user_password, TAG_ANY);
 	smtp_header = fr_pair_find_by_da(request->packet->vps, attr_smtp_header, TAG_ANY);
@@ -319,7 +302,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(module_ctx_t const *mctx, REQU
 		RDEBUG2("Attribute \"User-Password\" is required for authentication");
 		return RLM_MODULE_INVALID;
 	}
-	/* Make sure all of the email components are present */
+	/* Make sure all of the essential email components are present and possible*/
 	if(!smtp_header) {
 		RDEBUG2("Attribute \"smtp-header\" is required for smtp");
 		return RLM_MODULE_INVALID;
@@ -339,55 +322,85 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(module_ctx_t const *mctx, REQU
 		RDEBUG2("A handle could not be allocated for the request");
 		return RLM_MODULE_FAIL;
 	}
-	/* prepare mail_ctx to process the request email */
+
+	/* Initialize the mail_ctx to perform the email */
 	mail_ctx = talloc_zero(randle, fr_mail_ctx);
 	mail_ctx->request 		= request;
 	mail_ctx->randle 		= randle;
-	mail_ctx->time_status 		= UNLOADED;
-	mail_ctx->function_source 	= header_source;
-	mail_ctx->time 			= fr_time();
+	mail_ctx->time_status 		= UNLOADED; /* prevent duplication if there is a user supplied a DATE: element */
+	mail_ctx->time 			= fr_time(); /* time the request was received. Set to DATE: if none is supplied */
 
-	/* Set the elements of the curl request */
-	FR_CURL_REQUEST_SET_OPTION(CURLOPT_USERNAME, username->vp_strvalue);
-	FR_CURL_REQUEST_SET_OPTION(CURLOPT_PASSWORD, password->vp_strvalue);
-	FR_CURL_REQUEST_SET_OPTION(CURLOPT_DEFAULT_PROTOCOL, "smtp");
+	/* Set the destructor function to free all of the curl_slist elements */
+	talloc_set_destructor(mail_ctx, _free_mail_slists);
+
+	/* Set the generic curl request conditions */
 	FR_CURL_REQUEST_SET_OPTION(CURLOPT_URL, inst->uri);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_DEFAULT_PROTOCOL, "smtp");
 	FR_CURL_REQUEST_SET_OPTION(CURLOPT_CONNECTTIMEOUT_MS, fr_time_delta_to_msec(inst->timeout));
 	FR_CURL_REQUEST_SET_OPTION(CURLOPT_TIMEOUT_MS, fr_time_delta_to_msec(inst->timeout));
 	FR_CURL_REQUEST_SET_OPTION(CURLOPT_VERBOSE, 1L);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_UPLOAD, 1L);
 
-	/* Set the recipient */
-	mail_ctx->recipients = NULL;
-       	if(recipients_source(mail_ctx) != 0) {
-		RDEBUG2("The recipients list could not be created");
-		curl_slist_free_all(mail_ctx->recipients);
-		return RLM_MODULE_INVALID;
-	}
-	mail_ctx->header= NULL;
-       	if(header_slist_source(mail_ctx) != 0) {
-		RDEBUG2("The header slist could not be created");
-		curl_slist_free_all(mail_ctx->header);
-		return RLM_MODULE_INVALID;
-	}
-	FR_CURL_REQUEST_SET_OPTION(CURLOPT_HTTPHEADER, mail_ctx->header);
-	FR_CURL_REQUEST_SET_OPTION(CURLOPT_MAIL_RCPT, mail_ctx->recipients);
-	/* Prepare the cursor to load in the header elements, which will then transition to the body elements */
-	vp = fr_cursor_iter_by_da_init(&mail_ctx->cursor, &mail_ctx->request->packet->vps, attr_smtp_header);
-	fr_dbuff_init(&mail_ctx->le_in, (uint8_t const *)le, 2*sizeof(unsigned char));
-	fr_dbuff_init(&mail_ctx->vp_in, (uint8_t const *)vp->vp_strvalue, vp->vp_length);
+	/* Set the username and password */
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_USERNAME, username->vp_strvalue);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_PASSWORD, password->vp_strvalue);
+
+	/* Set the sender email */
 	FR_CURL_REQUEST_SET_OPTION(CURLOPT_MAIL_FROM, sender_email->vp_strvalue);
 
-	/* Set the email read functions and provide request context*/
-	FR_CURL_REQUEST_SET_OPTION(CURLOPT_READFUNCTION, email_source); 	/* Uploads data. Changed to body_source later */
-	FR_CURL_REQUEST_SET_OPTION(CURLOPT_READDATA, mail_ctx); 		/* All context for the request */
-	FR_CURL_REQUEST_SET_OPTION(CURLOPT_UPLOAD, 1L); 			/* Tells curl to upload the data */
+	/* Set the recipients */
+	mail_ctx->recipients = NULL; /* Prepare the recipients curl_slist to be initialized */
+       	if(recipients_source(mail_ctx) <= 0) {
+		RDEBUG2("At least one recipient is required to send an email");
+		goto error;
+	}
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_MAIL_RCPT, mail_ctx->recipients);
+
+	/* Set the header elements */
+	mail_ctx->header = NULL; /* Prepare the header curl_slist to be initialized */
+       	if(header_source(mail_ctx) != 0) {
+		RDEBUG2("The header slist could not be created");
+		goto error;
+	}
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_HTTPHEADER, mail_ctx->header);
+
+	/* Initialize the mime structures for encoding data */
+	mime = curl_mime_init(randle->candle); /* Holds the non-essential email data */
+	mime_body = curl_mime_init(randle->candle); /* used to apply special conditions to the body elements */
+
+	/* initialize the cursor by the body_source function*/
+	vp = fr_cursor_iter_by_da_init(&mail_ctx->mime_cursor, &mail_ctx->request->packet->vps, attr_smtp_body);
+	fr_dbuff_init(&mail_ctx->vp_in, (uint8_t const *)vp->vp_strvalue, vp->vp_length);
+
+	/* Initialize the cursor to generate the parts for every body element */
+	vp = fr_cursor_iter_by_da_init(&mail_ctx->cursor, &mail_ctx->request->packet->vps, attr_smtp_body);
+
+	/* Add a mime part to mime_body for every body element */
+	body_elements = 0;
+	while(vp){
+		body_elements++;
+		part = curl_mime_addpart(mime_body);
+		curl_mime_encoder(part, "base64");
+		curl_mime_data_cb(part, vp->vp_length, body_source, NULL, NULL, mail_ctx);
+		vp = fr_cursor_next(&mail_ctx->cursor);
+	}
+	RDEBUG2("initialized %d body element part(s)", body_elements);
+
+	/* Add body_mime as a subpart of the mime request with a local content-disposition*/
+	part = curl_mime_addpart(mime);
+	curl_mime_subparts(part, mime_body);
+	curl_mime_type(part, "multipart/mixed" );
+	mail_ctx->body_header = curl_slist_append(NULL, "Content-Disposition: inline"); /* Initialize the body_header curl_slist */
+	curl_mime_headers(part, mail_ctx->body_header, 1);
 
 	/* Set the attachments if there are any*/
-	mime = curl_mime_init(randle->candle);
-	if(attachments_source(mail_ctx, mime) > 0){
-		RDEBUG2("Attachments Added");
-		FR_CURL_REQUEST_SET_OPTION(CURLOPT_MIMEPOST, mime);
+	if(attachments_source(mail_ctx, mime) == 0){
+		RDEBUG2("No files were attached to the email");
 	}
+
+	/* Add the mime endoced elements to the curl request */
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_MIMEPOST, mime);
+
 	/* Initialize tls if it has been set up */
 	if (fr_curl_easy_tls_init(randle, &inst->tls) != 0) return RLM_MODULE_INVALID;
 
@@ -395,8 +408,6 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(module_ctx_t const *mctx, REQU
 
 	return unlang_module_yield(request, mod_authorize_result, NULL, mail_ctx);
 error:
-	curl_slist_free_all(mail_ctx->recipients);
-	curl_slist_free_all(mail_ctx->header);
 	return RLM_MODULE_INVALID;
 }
 /*
@@ -526,10 +537,9 @@ static int mod_thread_instantiate(UNUSED CONF_SECTION const *conf, void *instanc
  */
 static int mod_thread_detach(UNUSED fr_event_list_t *el, void *thread)
 {
-    rlm_smtp_thread_t    *t = thread;
-
-    talloc_free(t->mhandle);
-    return 0;
+	rlm_smtp_thread_t    *t = thread;
+	talloc_free(t->mhandle);
+	return 0;
 }
 
 /*
