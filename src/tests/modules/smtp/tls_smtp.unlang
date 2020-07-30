@@ -1,0 +1,29 @@
+update request {
+	&SMTP-Mail-Header += "Subject: smtp test"
+	&SMTP-Mail-Header += "FROM: smtp_sender@gmail.com"
+	&SMTP-Mail-Header += "TO: smtp_receiver@localhost"
+	&SMTP-Mail-Body += "sent from the smtp test module\r\n"
+	&SMTP-Sender-Email += "smtp_sender@localhost"
+	&SMTP-Recipients += "smtp_receiver@localhost"
+	&SMTP-Attachments += "build/ci/exim4/testfile"
+}
+smtp.authorize
+
+# Create the expected output file
+`/bin/sh -c "{ echo -n 'sent from the smtp test module'; cat build/ci/exim4/testfile; } > build/ci/exim4/expected_output" `
+
+#
+# Extract the full contents of the email
+# Pull out the base64 encoded test, decode it, trim line endings
+# Compare the result with the expected output
+#
+if (`/bin/sh -c "cat build/ci/exim4/mail/smtp_receiver | \
+grep -E '^[A-Za-z0-9+/]{4}*([A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)$' | base64 -d | tr -d '\r\n' | \
+grep -f build/ci/exim4/expected_output | echo $?"` == 0){
+	update control {
+		&Auth-Type := Accept
+	}
+}
+else {
+	reject
+}
